@@ -1,13 +1,13 @@
 name: release
 on:
-  schedule:
-    - cron: '5 5 * * *'
-  workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Tag name for release'
-        required: false
-        default: nightly
+  # schedule:
+  #   - cron: '5 5 * * *'
+  # workflow_dispatch:
+  #   inputs:
+  #     tag_name:
+  #       description: 'Tag name for release'
+  #       required: false
+  #       default: nightly
   push:
     tags:
       - v[0-9]+.[0-9]+.[0-9]+
@@ -52,39 +52,49 @@ jobs:
           - runner: ubuntu-22.04-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
+    # The runner images already link against a recent glibc (2.35+), so build
+    # inside the oldest supported Ubuntu (20.04, glibc 2.31) to keep the
+    # resulting binaries runnable on older distros.
+    container:
+      image: ubuntu:20.04
     env:
       CC: ${{ matrix.cc }}
-      LDAI_NO_APPSTREAM: 1 # skip checking (broken) AppStream metadata for issues
     outputs:
       version: ${{ steps.build.outputs.version }}
     steps:
+      # A bare container image lacks git/sudo, which actions/checkout and
+      # install_deps.sh rely on, and tzdata, whose debconf prompt has no one to
+      # answer it (no controlling terminal in the container). Install tzdata up
+      # front, noninteractively, so later apt runs can't stop on that prompt.
+      - name: Install container prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git sudo tzdata
+
+      # The workspace is owned by the runner's user, not by the container's
+      # root, so git refuses to touch the repository ("dubious ownership").
+      # actions/checkout registers a safe.directory for it, but that goes into a
+      # temporary global config which later steps in the container don't see.
+      # Set it system-wide, which lives in /etc/gitconfig inside the container.
+      - name: Mark workspace as a safe git directory
+        run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@v7.0.1
         with:
           # Perform a full checkout #13471
           fetch-depth: 0
           persist-credentials: false
       - run: ./.github/scripts/install_deps.sh
-      - run: sudo apt-get install -y libfuse2
 
       - run: echo "CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}" >> $GITHUB_ENV
         env:
           CMAKE_BUILD_TYPE: ${{ needs.setup.outputs.build_type }}
 
-      - name: appimage
-        env:
-          APPIMAGE_TAG: ${{ needs.setup.outputs.appimage_tag }}
-        run:  |
-          ./scripts/genappimage.sh "${APPIMAGE_TAG}"
+      - name: Build
+        run: make CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
 
       - name: tar.gz
         run: cpack --config build/CPackConfig.cmake -G TGZ
-      - uses: actions/upload-artifact@v7
-        with:
-          name: nvim-appimage-${{ matrix.arch }}
-          path: |
-            build/bin/nvim-linux-${{ matrix.arch }}.appimage
-            build/bin/nvim-linux-${{ matrix.arch }}.appimage.zsync
-          retention-days: 1
       - uses: actions/upload-artifact@v7
         with:
           name: nvim-linux-${{ matrix.arch }}
@@ -287,6 +297,6 @@ jobs:
         run: |
           envsubst < "$GITHUB_WORKSPACE/.github/workflows/notes.md" > "$RUNNER_TEMP/notes.md"
           if [ "$TAG_NAME" != "nightly" ]; then
-            gh release create stable $PRERELEASE --notes-file "$RUNNER_TEMP/notes.md" --title "$SUBJECT" --target $GITHUB_SHA nvim-macos-x86_64/* nvim-macos-arm64/* nvim-linux-x86_64/* nvim-linux-arm64/* nvim-appimage-x86_64/* nvim-appimage-arm64/* nvim-win-x86_64/* nvim-win-arm64/* nvim-wasm-emscripten/*
+            gh release create stable $PRERELEASE --notes-file "$RUNNER_TEMP/notes.md" --title "$SUBJECT" --target $GITHUB_SHA nvim-macos-x86_64/* nvim-macos-arm64/* nvim-linux-x86_64/* nvim-linux-arm64/* nvim-win-x86_64/* nvim-win-arm64/* nvim-wasm-emscripten/*
           fi
-          gh release create $TAG_NAME $PRERELEASE --notes-file "$RUNNER_TEMP/notes.md" --title "$SUBJECT" --target $GITHUB_SHA nvim-macos-x86_64/* nvim-macos-arm64/* nvim-linux-x86_64/* nvim-linux-arm64/* nvim-appimage-x86_64/* nvim-appimage-arm64/* nvim-win-x86_64/* nvim-win-arm64/* nvim-wasm-emscripten/*
+          gh release create $TAG_NAME $PRERELEASE --notes-file "$RUNNER_TEMP/notes.md" --title "$SUBJECT" --target $GITHUB_SHA nvim-macos-x86_64/* nvim-macos-arm64/* nvim-linux-x86_64/* nvim-linux-arm64/* nvim-win-x86_64/* nvim-win-arm64/* nvim-wasm-emscripten/*
