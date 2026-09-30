@@ -278,7 +278,9 @@ EDITOR
   • Toggle cursors with |Q|, |<C-LeftMouse>|, or |nvim_mcursor()|.
   • Toggle "follow mode" with |q=|.
   • Clear cursors with |CTRL-L|, restore them with |gQ|.
-  • [count]Q places a cursor at every search match.
+  • |zq| places a cursor at all targets of a motion. E.g. "zqgn" places at
+    every match (and "gv" selects the matches), "Vzqw" places at every
+    Visual-selected word.
 • |:bcd| sets a buffer-local directory. |getcwd()| and |haslocaldir()| take
   `bufnr` as a third parameter.
 • |:lcd!| |:tcd!| |:bcd!| unsets the directory of that scope.
@@ -489,6 +491,9 @@ TERMINAL
 
 TREESITTER
 
+• |vim.treesitter.get_captures()| returns highlight captures at a given position,
+  on a whole line, or overlapping a range. It replaces
+  |vim.treesitter.get_captures_at_pos()|.
 • |v_]N| |v_[N| expand selection to sibling treesitter node.
 • |treesitter-highlight-conceal| can be removed by adding a `@noconceal`
   capture.
