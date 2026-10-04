@@ -859,6 +859,7 @@ is_na_patch() {
   local NA_HUNKS_C="$NVIM_SOURCE_DIR/scripts/vim_na_hunks_c.txt"
   local NA_HUNKS_H="$NVIM_SOURCE_DIR/scripts/vim_na_hunks_h.txt"
   local NA_HUNKS_HELP="$NVIM_SOURCE_DIR/scripts/vim_na_hunks_help.txt"
+  local NA_HUNKS_MAKE_PO="$NVIM_SOURCE_DIR/scripts/vim_na_hunks_make_po.txt"
   local NA_HUNKS_VIM="$NVIM_SOURCE_DIR/scripts/vim_na_hunks_vim.txt"
 
   local FILES_REMAINING HUNKS HUNK_NUM_FINAL
@@ -874,8 +875,10 @@ is_na_patch() {
           '-I^\s+$' \
           '-I^[-=]+$' \
           '-I^(Functions:|GUI|Other)\s~$' \
+          '-I^[A-Z]\s+\*\+sodium\*\s+compiled with ' \
           '-I^\|(ch|popup)_[_a-z]+\(\)\|' \
           '-I^popup_[_a-z]+\(' \
+          '-I^sodium\s+Compiled with ' \
           '-I\*\s+For Vim version [0-9]\.[0-9]\.\s+Last change: [0-9]+ [A-Z][a-z]+ [0-9]+' \
           '-I compiled (with|without) .*\(\|.+\|\) feature\.$' \
           '-I\{.+ (available|compiled) (with|without) .+\}' \
@@ -914,11 +917,7 @@ is_na_patch() {
           "$patch" -- "${file}")
         if test -n "$HUNKS"; then
           # shellcheck disable=SC2016
-          HUNK_NUM_FINAL=$(echo "$HUNKS" | grep '^@@ .* @@' | sed 's/^@@ .* @@ //' | grep -cv \
-            -e '^\$([_A-Z]\+)\.pot:' \
-            -e '^clean:' \
-            -e '^g\?vim\.desktop:' \
-            )
+          HUNK_NUM_FINAL=$(echo "$HUNKS" | grep '^@@ .* @@' | sed 's/^@@ .* @@ //' | grep -cv -f "$NA_HUNKS_MAKE_PO")
           test "$HUNK_NUM_FINAL" -ne 0 && return 1
         fi
         ;;
@@ -1018,7 +1017,7 @@ is_na_patch() {
           '-IEVENT_TERMINALWINOPEN' \
           '-I^#\s*include\s+<proto/' \
           '-I^\s+\{"ch_[_a-z]+",.*\sFEARG_[1-9],\s+arg[1-9]+_' \
-          '-I^\s+\{"(popup|prop|sound)_[_a-z]+",.*f_(popup|prop|sound)_[_a-z]+},$' \
+          '-I^\s+\{"(popup|prop|sound)_[_a-z]+",.*f_(popup|prop|sound)_[_a-z]+\)?},$' \
           '-I^\s+ret_[a-z]+,\s+(JOB|PROP)_FUNC\(f_.+\)},$' \
           '-I^\s*(static)?\s(char(|_u)|hashtab_T|int|void)( \*)?$' \
           '-I^static\s(char(|_u)|hashtab_T|int|void)\s\*?[^*]+\(.+\);$' \
