@@ -1,4 +1,4 @@
---- Converts Nvim :help files to alternate formats (HTML or Typst).
+--- Converts Nvim :help files to alternate formats (HTML, Typst, or "amalgamated" HTML page).
 --- Validates |tag| links and document syntax (parser errors).
 --
 -- USAGE (For CI/local testing purposes): Simply `make lintdoc`, which basically does the following:
@@ -21,6 +21,15 @@
 --   5. mv pdf_docs/usr_toc.typ pdf_docs/user_manual.typ && cat pdf_docs/usr_*.typ >> pdf_docs/user_manual.typ
 --   6. typst compile pdf_docs/user_manual.typ
 --   7. open pdf_docs/user_manual.pdf
+--
+-- USAGE (GENERATE PDF VIA BROWSER):
+--   1. `:helptags ALL`
+--   2. nvim -V1 -es --clean +"lua require('src.gen.gen_help_html').gen('print', './runtime/doc', 'pdf_docs')" +q
+--      - To print only some files, pass them (in order) as `include`. Example (user manual):
+--        {'usr_toc.txt', unpack(vim.tbl_map(vim.fs.basename, vim.fn.glob('runtime/doc/usr_[0-9]*.txt', 0, 1)))}
+--   3. chrome --headless --no-pdf-header-footer --disable-pdf-tagging --print-to-pdf=pdf_docs/nvim-help.pdf pdf_docs/print.html
+--      (macOS: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+--   4. open pdf_docs/nvim-help.pdf
 --
 -- USAGE (VALIDATE):
 --   1. nvim -V1 -es +"lua require('src.gen.gen_help_html').validate('./runtime/doc')" +q
@@ -77,6 +86,7 @@ local M = {}
 -- These files are generated with "flow" layout (non fixed-width, wrapped text paragraphs).
 -- All other files are "legacy" files which require fixed-width layout.
 local new_layout = {
+  ['api-ui-events.txt'] = true,
   ['api.txt'] = true,
   ['channel.txt'] = true,
   ['deprecated.txt'] = true,
@@ -89,16 +99,26 @@ local new_layout = {
   ['dev_vimpatch.txt'] = true,
   ['diagnostic.txt'] = true,
   ['faq.txt'] = true,
+  ['ft_hare.txt'] = true,
+  ['ft_ps1.txt'] = true,
+  ['ft_raku.txt'] = true,
   ['gui.txt'] = true,
+  ['health.txt'] = true,
   ['help.txt'] = true,
+  ['helphelp.txt'] = true,
+  ['index.txt'] = true,
   ['intro.txt'] = true,
   ['job_control.txt'] = true,
+  ['l10n-russian.txt'] = true,
+  ['l10n-vietnamese.txt'] = true,
   ['lsp.txt'] = true,
+  ['lua-async.txt'] = true,
   ['lua-bit.txt'] = true,
   ['lua-guide.txt'] = true,
   ['lua-plugin.txt'] = true,
   ['lua.txt'] = true,
   ['luaref.txt'] = true,
+  ['luvref.txt'] = true,
   ['news-0.10.txt'] = true,
   ['news-0.11.txt'] = true,
   ['news-0.12.txt'] = true,
@@ -106,12 +126,22 @@ local new_layout = {
   ['news.txt'] = true,
   ['nvim.txt'] = true,
   ['pack.txt'] = true,
+  ['pattern.txt'] = true,
+  ['pi_gzip.txt'] = true,
+  ['pi_paren.txt'] = true,
+  ['pi_spec.txt'] = true,
+  ['pi_tutor.txt'] = true,
+  ['plugins.txt'] = true,
   ['provider.txt'] = true,
+  ['remote_plugin.txt'] = true,
+  ['rileft.txt'] = true,
   ['starting.txt'] = true,
+  ['support.txt'] = true,
   ['terminal.txt'] = true,
   ['tui.txt'] = true,
   ['ui.txt'] = true,
   ['vim_diff.txt'] = true,
+  ['zip.txt'] = true,
 }
 
 -- Map of new-page:old-page, to redirect renamed pages.
@@ -260,7 +290,8 @@ local function is_noise(line, noise_lines)
     -- Example: "vim:tw=78:ts=8:sw=4:sts=4:et:ft=help:norl:"
     or line:find('^%s*vim?%:.*ft=help')
     or line:find('^%s*vim?%:.*filetype=help')
-    or line:find('[*>]local%-additions[*<]')
+    -- help.txt `*local-additions*` tag definition, not taglink.
+    or line:find('[*"]local%-additions[*"]')
   then
     -- table.insert(stats.noise_lines, getbuflinestr(root, opt.buf, 0))
     table.insert(noise_lines or {}, line)
@@ -339,6 +370,68 @@ local function trim_indent(s)
   return (vim.text.indent(0, s, { expandtab = 8 }))
 end
 
+--- Gets the display column (tabstop 8) where `node` starts.
+--- @param node TSNode
+--- @param bufnr integer
+local function get_col(node, bufnr)
+  local row, col = node:range()
+  local w = 0
+  for c in vim.fn.getbufline(bufnr, row + 1)[1]:sub(1, col):gmatch('[^\128-\191][\128-\191]*') do
+    w = c == '\t' and (w + 8 - w % 8) or (w + 1)
+  end
+  return w
+end
+
+--- Splits the named children of `node` into cells (tab-delimited).
+---@param node TSNode
+---@param bufnr integer
+---@return TSNode[][]
+local function get_table_cells(node, bufnr)
+  local cells = { {} } ---@type TSNode[][]
+  local prev ---@type TSNode?
+  for child in node:iter_children() do
+    if child:named() then
+      local sr, sc = child:range()
+      local _, _, pr, pc = (prev or child):range()
+      if prev and table.concat(vim.api.nvim_buf_get_text(bufnr, pr, pc, sr, sc, {})):find('\t') then
+        cells[#cells + 1] = {}
+      end
+      table.insert(cells[#cells], child)
+      prev = child
+    end
+  end
+  return cells
+end
+
+--- Gets the rows (header first) of `block` if it is a table, else nil. Each row is a list of cells,
+--- each cell a list of nodes. Separator => empty row. See "Tables" in the tree-sitter-vimdoc README.
+---@param block TSNode
+---@param bufnr integer
+---@return TSNode[][][]?
+local function get_table(block, bufnr)
+  local hdr = block:named_child(0) and block:named_child(0):named_child(0)
+  if not hdr or hdr:type() ~= 'column_heading' then
+    return nil
+  end
+  -- (column_heading (heading …) (delimiter))
+  local rows = { get_table_cells(assert(hdr:named_child(0)), bufnr) } ---@type TSNode[][][]
+  for i = 1, block:named_child_count() - 1 do
+    local line = assert(block:named_child(i))
+    local is_sep = vim.treesitter.get_node_text(line, bufnr):match('^[%s%-=~]+$')
+    local row = not is_sep and get_table_cells(line, bufnr)
+    local last = rows[#rows]
+    local in_body = #rows > 1 and #last > 0 -- Last row is not the header or a separator.
+    if is_sep and in_body then
+      rows[#rows + 1] = {}
+    elseif row and #row == 1 and in_body then
+      vim.list_extend(last[#last], row[1]) -- Wrapped line continues last cell.
+    elseif row then
+      rows[#rows + 1] = row
+    end
+  end
+  return #rows[1] > 1 and #rows > 1 and rows or nil
+end
+
 --- Gets raw buffer text in the node's range (+/- an offset), as a newline-delimited string.
 ---@param node TSNode
 ---@param bufnr integer
@@ -351,18 +444,36 @@ local function getbuflinestr(node, bufnr, offset)
   return table.concat(lines, '\n')
 end
 
---- Gets the whitespace just before `node` from the raw buffer text.
---- Needed for preformatted `old` lines.
+--- Gets the whitespace just before `node` from the raw buffer text (nodes don't include it, e.g.
+--- it separates words).
+---
 ---@param node TSNode
 ---@param bufnr integer
+---@param conceal? boolean For preformatted `old` lines: Tab is preceded by a space for each char
+---   concealed on the line since the previous Tab: Nvim widens the Tab by that much, so text after a
+---   Tab stays at its raw column.
 ---@return string
-local function getws(node, bufnr)
+local function getws(node, bufnr, conceal)
   local line1, c1, line2, _ = node:range()
   ---@type string
   local raw = vim.fn.getbufline(bufnr, line1 + 1, line2 + 1)[1]
   local text_before = raw:sub(1, c1)
   local leading_ws = text_before:match('%s+$') or ''
-  return leading_ws
+  if not conceal or not leading_ws:find('\t') then
+    return leading_ws
+  end
+
+  -- TODO: Remove `conceal` when all docs are in `new_layout`.
+  local n = 0
+  local sib = node:prev_named_sibling()
+  while sib and select(3, sib:range()) == line1 do
+    n = n + (vim.list_contains({ 'taglink', 'tag', 'codespan' }, sib:type()) and 2 or 0)
+    if getws(sib, bufnr):find('\t') then
+      break
+    end
+    sib = sib:prev_named_sibling()
+  end
+  return (leading_ws:gsub('\t', ('%s\t'):format((' '):rep(n)), 1))
 end
 
 local function get_tagname(node, bufnr)
@@ -544,20 +655,6 @@ local function visit_validate(root, level, lang_tree, opt, stats)
   end
 end
 
--- Fix tab alignment issues caused by concealed characters like |, `, * in tags
--- and code blocks.
----@param text string
----@param next_node_text string
-local function fix_tab_after_conceal(text, next_node_text)
-  -- Vim tabs take into account the two concealed characters even though they
-  -- are invisible, so we need to add back in the two spaces if this is
-  -- followed by a tab to make the tab alignment to match Vim's behavior.
-  if string.sub(next_node_text, 1, 1) == '\t' then
-    text = text .. '  '
-  end
-  return text
-end
-
 ---@class (exact) nvim.gen_help_html.heading
 ---@field name string
 ---@field subheadings nvim.gen_help_html.heading[]
@@ -575,14 +672,14 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
 
   local function node_text(node, ws_)
     node = node or root
-    ws_ = (ws_ == nil or ws_ == true) and getws(node, opt.buf) or ''
+    ws_ = (ws_ == nil or ws_ == true) and getws(node, opt.buf, opt.old) or ''
     return string.format('%s%s', ws_, vim.treesitter.get_node_text(node, opt.buf))
   end
 
   -- Gets leading whitespace of `node`.
   local function ws(node)
     node = node or root
-    local ws_ = getws(node, opt.buf)
+    local ws_ = getws(node, opt.buf, opt.old)
     -- XXX: first node of a (line) includes whitespace, even after
     -- https://github.com/neovim/tree-sitter-vimdoc/pull/31 ?
     if ws_ == '' then
@@ -595,6 +692,32 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
   local prev, next_ = get_prev_next(root)
   -- Parent kind (string).
   local parent = root:parent() and root:parent():type() or nil
+
+  local table_rows = node_name == 'block' and get_table(root, opt.buf)
+  if table_rows then
+    local trs = {} ---@type string[]
+    for i, row in ipairs(table_rows) do
+      local tag = i == 1 and 'th' or 'td'
+      local next_row = table_rows[i + 1]
+      -- Empty row = separator.
+      local attr = next_row and #next_row == 0 and ' class="help-table-sep"' or ''
+      local cells = {} ---@type string[]
+      for _, cell in ipairs(row) do
+        local s = ''
+        for _, node in ipairs(cell) do
+          s = s .. ts_node_to_html(node, level + 1, lang_tree, headings, opt, stats)
+        end
+        cells[#cells + 1] = ('<%s>%s</%s>'):format(tag, trim(s), tag)
+      end
+      if #row > 0 then
+        trs[#trs + 1] = ('<tr%s>%s</tr>'):format(attr, table.concat(cells))
+      end
+    end
+    return ('<table class="help-table">\n<thead>%s</thead>\n<tbody>\n%s\n</tbody>\n</table>\n'):format(
+      trs[1],
+      table.concat(trs, '\n', 2)
+    )
+  end
 
   local text = ''
   local trimmed ---@type string
@@ -701,6 +824,9 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
     then
       return '' -- Discard common "noise" lines.
     end
+    if parent == 'codeblock' or parent == 'code' then
+      return text -- Includes its newline.
+    end
     -- XXX: Avoid newlines (too much whitespace) after block elements in old (preformatted) layout.
     local div = opt.old
       and root:child(0)
@@ -715,8 +841,9 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
     local prev_li = sib and sib:type() == 'line_li'
     local cssclass = numli and 'help-li-num' or 'help-li'
 
-    -- Conjoin list items separated by blank lines (wrapped in separate blocks).
-    if not prev_li then
+    -- Conjoin list items separated by blank lines (wrapped in separate blocks), unless the block
+    -- starts with something else (then it's a new list).
+    if not sib then
       local parent_block = root:parent()
       local prev_block = parent_block and parent_block:prev_sibling()
       local prev_last = prev_block and prev_block:type() == 'block' and last(prev_block)
@@ -726,30 +853,33 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
       end
     end
 
+    -- Column of the prefix, not `root`: it may start at a codeblock-terminating "<".
+    local this_w = get_col(assert(prefix), opt.buf)
     if not prev_li then
       opt.indent = 1
-      -- Track the leading whitespace for each indent level so that we can dedent
+      -- Track the indent width for each indent level so that we can dedent
       -- to the correct level later.
-      opt.indent_ws = { ws() }
+      opt.indent_w = { this_w }
     else
-      opt.indent_ws = opt.indent_ws or { ws() }
-      local sib_ws = ws(sib)
-      local this_ws = ws()
-      if get_indent(node_text()) == 0 then
+      opt.indent_w = opt.indent_w or { this_w }
+      local sib_w = get_col(assert(first(sib, 'prefix')), opt.buf)
+      -- Unindented listitem is top-level. Check only its first line: other lines in the captured
+      -- listitem may be at column 0 (e.g. codeblock ">" or "<").
+      if this_w == 0 then
         opt.indent = 1
-        opt.indent_ws = { this_ws }
-      elseif this_ws > sib_ws then
+        opt.indent_w = { this_w }
+      elseif this_w > sib_w then
         -- Previous sibling is logically the _parent_ if it is indented less.
         opt.indent = opt.indent + 1
-        opt.indent_ws[opt.indent] = this_ws
-      elseif this_ws < sib_ws then
-        -- Dedent: pop indent levels whose tracked whitespace is deeper than the
-        -- current item, so we return to the correct ancestor level.
-        while opt.indent > 1 and (opt.indent_ws[opt.indent] or '') > this_ws do
-          opt.indent_ws[opt.indent] = nil
+        opt.indent_w[opt.indent] = this_w
+      elseif this_w < sib_w then
+        -- Dedent: pop indent levels deeper than the current item, so we return to the correct
+        -- ancestor level.
+        while opt.indent > 1 and (opt.indent_w[opt.indent] or 0) > this_w do
+          opt.indent_w[opt.indent] = nil
           opt.indent = opt.indent - 1
         end
-        opt.indent_ws[opt.indent] = this_ws
+        opt.indent_w[opt.indent] = this_w
       end
     end
     local margin = opt.indent == 1 and '' or ('margin-left: %drem;'):format((1.5 * opt.indent))
@@ -760,31 +890,23 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
     if ignored or not helppage then
       return html_esc(node_text(root))
     end
-    local s = ('%s<a href="/doc/user/%s#%s">%s</a>'):format(
+    return ('%s<a href="/doc/user/%s#%s">%s</a>'):format(
       ws(),
       helppage,
       url_encode(tagname),
       html_esc(tagname)
     )
-    if opt.old and node_name == 'taglink' then
-      s = fix_tab_after_conceal(s, node_text(root:next_sibling()))
-    end
-    return s
   elseif vim.list_contains({ 'codespan', 'keycode' }, node_name) then
     if root:has_error() then
       return text
     end
-    local s = ('%s<code>%s</code>'):format(ws(), trimmed)
-    if opt.old and node_name == 'codespan' then
-      s = fix_tab_after_conceal(s, node_text(root:next_sibling()))
-    end
-    return s
+    return ('%s<code>%s</code>'):format(ws(), trimmed)
   elseif node_name == 'argument' then
     return ('%s<code>%s</code>'):format(ws(), trim(node_text(root)))
   elseif node_name == 'codeblock' then
     return text
   elseif node_name == 'language' then
-    language = node_text(root)
+    language = trim(node_text(root))
     return ''
   elseif node_name == 'code' then -- Highlighted codeblock (child).
     if is_blank(text) then
@@ -806,7 +928,8 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
       return text
     end
     local in_heading = vim.list_contains({ 'h1', 'h2', 'h3' }, parent)
-    local h4 = not in_heading and not next_ and get_indent(node_text()) > 8 -- h4 pseudo-heading
+    local raw = getws(root, opt.buf) .. node_text(root, false) -- Without `conceal` padding.
+    local h4 = not in_heading and not next_ and get_indent(raw) > 8 -- h4 pseudo-heading
     local cssclass = h4 and 'help-tag-right' or 'help-tag'
     local tagname = node_text(root:child(1), false)
     if vim.tbl_count(stats.first_tags) < 2 then
@@ -825,9 +948,6 @@ local function ts_node_to_html(root, level, lang_tree, headings, opt, stats)
       trimmed,
       el
     )
-    if opt.old then
-      s = fix_tab_after_conceal(s, node_text(root:next_sibling()))
-    end
 
     if in_heading and prev ~= 'tag' then
       -- Start the <span> container for tags in a heading.
@@ -893,6 +1013,35 @@ local function ts_node_to_typ(root, level, lang_tree, opt, stats)
   local prev, next_ = get_prev_next(root)
   -- Parent kind (string).
   local parent = root:parent() and root:parent():type() or nil
+
+  local table_rows = node_name == 'block' and get_table(root, opt.buf)
+  if table_rows then
+    -- Typst fills a flat cell list row by row, so pad every row to the widest row.
+    local ncols = 0
+    for _, row in ipairs(table_rows) do
+      ncols = math.max(ncols, #row)
+    end
+    local trs = {} ---@type string[]
+    for i, row in ipairs(table_rows) do
+      local cells = {} ---@type string[]
+      for j = 1, ncols do
+        local s = ''
+        for _, node in ipairs(row[j] or {}) do
+          s = s .. ts_node_to_typ(node, level + 1, lang_tree, opt, stats)
+        end
+        cells[#cells + 1] = ('[%s]'):format(trim(s))
+      end
+      local tr = table.concat(cells, ', ')
+      if i == 1 then
+        trs[#trs + 1] = ('table.header(%s),'):format(tr)
+      elseif #row == 0 then
+        trs[#trs + 1] = 'table.hline(stroke: 2pt),' -- Separator (see `get_table`).
+      else
+        trs[#trs + 1] = ('%s,'):format(tr)
+      end
+    end
+    return ('#table(columns: %d,\n  %s\n)\n'):format(ncols, table.concat(trs, '\n  '))
+  end
 
   local text = ''
   local trimmed ---@type string
@@ -1002,7 +1151,7 @@ local function ts_node_to_typ(root, level, lang_tree, opt, stats)
   elseif node_name == 'codeblock' then
     return text
   elseif node_name == 'language' then
-    language = node_text(root)
+    language = trim(node_text(root))
     return ''
   elseif node_name == 'code' then -- Highlighted codeblock (child).
     if is_blank(text) then
@@ -1024,9 +1173,6 @@ local function ts_node_to_typ(root, level, lang_tree, opt, stats)
     local tagname = node_text(root:child(1), false)
     -- NOTE: the <%s> syntax doesn't work because it terminates the heading
     local s = ('%s%s #label("%s")'):format(ws(), text, typ_str_esc(tagname))
-    if opt.old then
-      s = fix_tab_after_conceal(s, node_text(root:next_sibling()))
-    end
 
     if in_heading and prev ~= 'tag' then
       -- Add fractional spacing to right-align the tags in a heading
@@ -1168,6 +1314,7 @@ end
 ---
 --- @return string html
 --- @return table stats
+--- @return string main HTML body, without the Hugo front matter.
 local function gen_one_html(fname, text, to_fname, old, commit)
   local stats = {
     noise_lines = {},
@@ -1217,7 +1364,7 @@ local function gen_one_html(fname, text, to_fname, old, commit)
 
   vim.cmd('q!')
   lang_tree:destroy()
-  return html, stats
+  return html, stats, main
 end
 
 --- Generates Typst from one :help file `fname`.
@@ -1404,6 +1551,58 @@ local function gen_redirect_pages(commit, helpfile, to_dir, to_fname)
   return true
 end
 
+--- Stylesheet for `output_format=print` (PDF generation via `chrome --headless`).
+local print_css = [[
+  @page { size: A4; margin: 15mm; }
+  body { font: 10.5pt/1.4 system-ui, sans-serif; }
+  a { color: inherit; }
+  .chapter { break-before: page; }
+  .chapter:first-child { break-before: auto; }
+  h1, h2, h3, h4 { break-after: avoid; }
+  .help-heading { display: flex; flex-flow: row wrap; justify-content: space-between; gap: 0 1em; }
+  pre, code, .old-help-para { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  pre, .old-help-para { font-size: 9pt; white-space: pre-wrap; tab-size: 8; }
+  pre { background: #f4f4f4; padding: 0.4em 0.6em; break-inside: avoid; }
+  .help-para, .old-help-para { margin: 0.6em 0; counter-reset: li; }
+  .help-li, .help-li-num { display: list-item; margin-left: 1.5em; }
+  .help-li-num { list-style: none; }
+  .help-li-num::before { counter-increment: li; content: counter(li) ". "; margin-left: -1em; }
+  .help-tag, .help-tag-right { color: #0a6b52; }
+  .help-tag-right { float: right; }
+  .help-column_heading { font-weight: bold; }
+  .help-table { border-collapse: collapse; margin: 0.6em 0; break-inside: avoid; }
+  .help-table th, .help-table td { padding: 0.15em 0.8em; text-align: left; vertical-align: top; border-bottom: 1px solid #ccc; }
+  .help-table th, .help-table-sep td { border-bottom-color: #888; }
+]]
+
+--- Joins page bodies into one standalone HTML page, for printing to PDF.
+--- Links to `helpfiles` become in-page links; other links go to neovim.io.
+---
+--- @param chapters string[] Page bodies.
+--- @param helpfiles string[] Source files of `chapters`.
+--- @return string
+local function gen_print_html(chapters, helpfiles)
+  local pages = {} ---@type table<string, true>
+  for _, f in ipairs(helpfiles) do
+    pages[(get_helppage_html(vim.fs.basename(f)):gsub('/$', ''))] = true
+  end
+  local body = table.concat(chapters, '\n')
+  body = body:gsub('href="/doc/user/([^"#]*)(#?[^"]*)"', function(page, anchor)
+    page = page:gsub('/$', '')
+    if pages[page] and anchor ~= '' then
+      return ('href="%s"'):format(anchor)
+    end
+    return ('href="https://neovim.io/doc/user/%s%s"'):format(
+      page == '' and '' or page .. '/',
+      anchor
+    )
+  end)
+  return ('<!doctype html>\n<html><head><meta charset="utf-8"><title>Nvim</title>\n<style>\n%s</style>\n</head><body>\n%s\n</body></html>\n'):format(
+    vim.text.indent(0, print_css),
+    body
+  )
+end
+
 --- @class nvim.gen_help_html.gen_result
 --- @field helpfiles string[] list of generated HTML files, from the source docs {include}
 --- @field err_count integer number of parse errors in :help docs
@@ -1415,7 +1614,8 @@ end
 ---
 ---   gen('$VIMRUNTIME/doc', '/path/to/neovim.github.io/_site/doc/', {'api.txt', 'autocmd.txt', 'channel.txt'}, nil)
 ---
---- @param output_format string Currently only "html"
+--- @param output_format string "html", "typ" (Typst), or "print" (one standalone
+--- `to_dir/print.html` for printing to PDF, with the files in `include` order).
 --- @param help_dir string Source directory containing the :help files. Must run `make helptags` first.
 --- @param to_dir string Target directory where the output files will be written.
 --- @param include string[]|nil Process only these filenames. Example: {'api.txt', 'autocmd.txt', 'channel.txt'}
@@ -1449,6 +1649,33 @@ function M.gen(output_format, help_dir, to_dir, include, commit, parser_path)
 
   tagmap = get_helptags(vim.fs.normalize(help_dir))
   helpfiles = get_helpfiles(help_dir, include)
+
+  -- Sort-order (matters for output_format=print).
+  -- Decided by `include`, else: help.txt, user manual, reference, rest alphabetically.
+  local order = {} ---@type table<string, integer>
+  local function add(f)
+    order[f] = order[f] or vim.tbl_count(order)
+  end
+  for _, f in ipairs(include or {}) do
+    add(f)
+  end
+  if not include and output_format == 'print' then
+    add('help.txt')
+    for _, toc in ipairs({ 'usr_toc.txt', 'help.txt' }) do
+      local path = ('%s/%s'):format(help_dir, toc)
+      if vim.fn.filereadable(path) == 1 then
+        add(toc)
+        for f in table.concat(vim.fn.readfile(path), '\n'):gmatch('|([%w_.-]+%.txt)|') do
+          add(f)
+        end
+      end
+    end
+  end
+  table.sort(helpfiles, function(a, b)
+    local fa, fb = vim.fs.basename(a), vim.fs.basename(b)
+    local oa, ob = order[fa] or math.huge, order[fb] or math.huge
+    return oa < ob or (oa == ob and fa < fb)
+  end)
   to_dir = vim.fs.normalize(to_dir)
 
   print(('output dir: %s\n\n'):format(to_dir))
@@ -1464,23 +1691,30 @@ function M.gen(output_format, help_dir, to_dir, include, commit, parser_path)
   local generators = {
     html = gen_one_html,
     typ = gen_one_typ,
+    print = gen_one_html,
   }
   local gen_one = generators[output_format]
+  local chapters = {} ---@type string[] Page bodies, for "print" format.
 
   for _, f in ipairs(helpfiles) do
     -- "foo.txt"
     local helpfile = vim.fs.basename(f)
 
     local to_fname = ''
-    if output_format == 'html' then
+    if output_format == 'html' or output_format == 'print' then
       -- "to/dir/foo.html"
       to_fname = ('%s/%s'):format(to_dir, get_helppage_html(helpfile, true))
     else
       to_fname = ('%s/%s.%s'):format(to_dir, helpfile:gsub('.txt', ''), output_format)
     end
 
-    local converted_help, stats = gen_one(f, nil, to_fname, not new_layout[helpfile], commit or '?')
-    tofile(to_fname, converted_help)
+    local converted_help, stats, main =
+      gen_one(f, nil, to_fname, not new_layout[helpfile], commit or '?')
+    if output_format == 'print' then
+      chapters[#chapters + 1] = ('<section class="chapter">\n%s\n</section>'):format(main)
+    else
+      tofile(to_fname, converted_help)
+    end
     print(
       ('generated (%-2s errors): %-15s => %s'):format(
         #stats.parse_errors,
@@ -1497,6 +1731,12 @@ function M.gen(output_format, help_dir, to_dir, include, commit, parser_path)
     end
 
     err_count = err_count + #stats.parse_errors
+  end
+
+  if output_format == 'print' then
+    local to_fname = ('%s/print.html'):format(to_dir)
+    tofile(to_fname, gen_print_html(chapters, helpfiles))
+    print(('\nprint: %s'):format(to_fname))
   end
 
   print(('\ngenerated %d pages'):format(#helpfiles + redirects_count))
